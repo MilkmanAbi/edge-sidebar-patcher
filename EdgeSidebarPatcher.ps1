@@ -42,8 +42,38 @@ $StateFile = 'sidebar-patch.json'
 
 function Get-UserDataDir {
     if ($UserDataDir) { return $UserDataDir }
+    if ($IsLinux) {   # $IsLinux/$IsMacOS only exist on PowerShell 7+; on 5.1 they are $null (= Windows)
+        $leaf = @{ Stable = 'microsoft-edge'; Beta = 'microsoft-edge-beta'; Dev = 'microsoft-edge-dev'; Canary = 'microsoft-edge-canary' }[$Channel]
+        return Join-Path $HOME ".config/$leaf"
+    }
+    if ($IsMacOS) {
+        $leaf = @{ Stable = 'Microsoft Edge'; Beta = 'Microsoft Edge Beta'; Dev = 'Microsoft Edge Dev'; Canary = 'Microsoft Edge Canary' }[$Channel]
+        return Join-Path $HOME "Library/Application Support/$leaf"
+    }
     $leaf = @{ Stable = 'Edge'; Beta = 'Edge Beta'; Dev = 'Edge Dev'; Canary = 'Edge SxS' }[$Channel]
     return Join-Path $env:LOCALAPPDATA "Microsoft\$leaf\User Data"
+}
+
+function Join-ProfilePath([string]$udd, [string]$dir, [string]$leaf) {
+    # nested Join-Path: works on 5.1 (no -AdditionalChildPath) and uses the right separator per OS
+    return Join-Path (Join-Path $udd $dir) $leaf
+}
+
+function Get-EdgeProcesses {
+    if ($IsLinux -or $IsMacOS) {
+        # Chromium rewrites its argv, and .NET derives ProcessName from it on Linux, so the name
+        # is unreliable (e.g. 'Get-Process msedge' finds nothing depending on launch flags).
+        # The executable path (/proc/<pid>/exe) is stable.
+        $rx = if ($IsMacOS) { '/Microsoft Edge[^/]*\.app/' } else { '/msedge$' }
+        return @(Get-Process | Where-Object { $_.Path -and $_.Path -match $rx })
+    }
+    return @(Get-Process msedge -ErrorAction SilentlyContinue)
+}
+
+function Get-ProcessCommandLine($p) {
+    # PowerShell 7 exposes .CommandLine on Windows and Linux; 5.1 needs CIM
+    if ($p.PSObject.Properties['CommandLine']) { return $p.CommandLine }
+    return (Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)").CommandLine
 }
 
 function Read-JsonFile([string]$Path) {
@@ -72,7 +102,7 @@ function Get-Profiles([string]$udd) {
     $ls = Read-JsonFile (Join-Path $udd 'Local State')
     $cache = Get-Dig $ls @('profile', 'info_cache')
     foreach ($dir in $cache.Keys) {
-        $pref = Join-Path $udd "$dir\Preferences"
+        $pref = Join-ProfilePath $udd $dir 'Preferences'
         $type = $null; $tower = $null
         if (Test-Path $pref) {
             $p = Read-JsonFile $pref
@@ -84,24 +114,32 @@ function Get-Profiles([string]$udd) {
             Name        = $cache[$dir]['name']
             AccountType = switch ($type) { 1 { 'personal (1)' } 2 { 'work/school (2)' } $null { 'not signed in' } default { "$type" } }
             TowerOn     = $tower
-            Patched     = Test-Path (Join-Path $udd "$dir\$StateFile")
+            Patched     = Test-Path (Join-ProfilePath $udd $dir $StateFile)
         }
     }
 }
 
 function Stop-Edge {
-    $procs = Get-Process msedge -ErrorAction SilentlyContinue
+    $procs = Get-EdgeProcesses
     if ($UserDataDir) {
         # custom user-data-dir (e.g. a test copy): only close instances running on it
-        $ids = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" | Where-Object { $_.CommandLine -like "*$UserDataDir*" } | ForEach-Object ProcessId
-        $procs = $procs | Where-Object { $ids -contains $_.Id }
+        $procs = @($procs | Where-Object { (Get-ProcessCommandLine $_) -like "*$UserDataDir*" })
     }
+    Write-Host "Edge processes found: $($procs.Count)"
     if (-not $procs) { return }
     if (-not $Yes) {
         $a = Read-Host 'Edge is running and has to be closed (tabs come back on restore). Close it now? [y/N]'
         if ($a -notmatch '^(y|yes)$') { throw 'Aborted: Edge is still running.' }
     }
-    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    # Ask nicely first so Edge saves its session (no "closed unexpectedly" bubble), then force.
+    # Edge writes Preferences on a clean exit too, which is fine: we edit after it has exited.
+    if ($IsLinux -or $IsMacOS) {
+        & kill -TERM @($procs | ForEach-Object Id) 2>$null
+    } else {
+        $procs | Where-Object { $_.MainWindowHandle -ne 0 } | ForEach-Object { [void]$_.CloseMainWindow() }
+    }
+    for ($i = 0; $i -lt 40 -and ($procs | Where-Object { -not $_.HasExited }); $i++) { Start-Sleep -Milliseconds 250 }
+    $procs | Where-Object { -not $_.HasExited } | Stop-Process -Force -ErrorAction SilentlyContinue
     for ($i = 0; $i -lt 40 -and ($procs | Where-Object { -not $_.HasExited }); $i++) { Start-Sleep -Milliseconds 250 }
     if ($procs | Where-Object { -not $_.HasExited }) { throw 'Edge did not exit; close it (and Startup Boost) and retry.' }
     Start-Sleep -Milliseconds 500   # let file handles drop
